@@ -32,7 +32,41 @@ else
     GUEST_EXE="${EXE_ARG}"
 fi
 
+chmod 1777 "${ROOTFS}/tmp" 2>/dev/null || true
+rm -rf "${ROOTFS}/tmp/.wine"* 2>/dev/null || true
+
 pkill -9 wineserver 2>/dev/null || true
+
+FORWARD_ENV=(
+    HOME=/root
+    USER=root
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    WINEDEBUG="${WINEDEBUG:--all}"
+    LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+    MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-llvmpipe}"
+    GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+)
+
+if [ -n "${WINEDLLOVERRIDES:-}" ]; then
+    FORWARD_ENV+=( WINEDLLOVERRIDES="${WINEDLLOVERRIDES}" )
+else
+    FORWARD_ENV+=( WINEDLLOVERRIDES="d3d11,dxgi=b" )
+fi
+if [ -n "${VK_ICD_FILENAMES:-}" ]; then
+    FORWARD_ENV+=( VK_ICD_FILENAMES="${VK_ICD_FILENAMES}" )
+fi
+if [ -n "${VK_DRIVER_FILES:-}" ]; then
+    FORWARD_ENV+=( VK_DRIVER_FILES="${VK_DRIVER_FILES}" )
+fi
+if [ -n "${DXVK_LOG_LEVEL:-}" ]; then
+    FORWARD_ENV+=( DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL}" )
+fi
+if [ -n "${DXVK_HUD:-}" ]; then
+    FORWARD_ENV+=( DXVK_HUD="${DXVK_HUD}" )
+fi
+if [ -n "${WINE_D3D_CONFIG:-}" ]; then
+    FORWARD_ENV+=( WINE_D3D_CONFIG="${WINE_D3D_CONFIG}" )
+fi
 
 set +e
 PROOT_NO_SECCOMP=1 PROOT_TMP_DIR="${PROOT_TMP}" \
@@ -42,10 +76,7 @@ PROOT_NO_SECCOMP=1 PROOT_TMP_DIR="${PROOT_TMP}" \
     -b /dev -b /proc -b /sys \
     -w /root \
     /usr/bin/env -i \
-    HOME=/root \
-    USER=root \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    WINEDEBUG="${WINEDEBUG:--all}" \
+    "${FORWARD_ENV[@]}" \
     /usr/bin/wine "${GUEST_EXE}" "$@"
 RC=$?
 set -e

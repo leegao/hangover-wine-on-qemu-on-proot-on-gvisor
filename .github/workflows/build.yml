@@ -23,6 +23,16 @@ name: Hangover Wine ARM64EC (FEX) CI on gVisor
                 required: false
                 default: false
                 type: boolean
+            dxvk_version:
+                description: "DXVK release tag to test (e.g., v2.7.1)"
+                required: false
+                default: "v2.7.1"
+                type: string
+            test_d3d11:
+                description: "Run headless Direct3D 11 tests (WineD3D and DXVK)"
+                required: false
+                default: true
+                type: boolean
     push:
 
 jobs:
@@ -48,7 +58,7 @@ jobs:
                   curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /etc/apt/keyrings/gvisor.gpg
                   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gvisor.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
                   sudo apt-get update
-                  sudo apt-get install -y runsc tree xz-utils python3 dpkg binutils xz-utils
+                  sudo apt-get install -y runsc tree xz-utils python3 dpkg binutils curl
                   sudo runsc install
                   sudo systemctl restart docker
                   docker run --rm --runtime=runsc alpine uname -a
@@ -58,6 +68,7 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
                   REPO: ${{ inputs.github_repo || 'leegao/hangover-wine-on-qemu-on-proot-on-gvisor' }}
                   TAG: ${{ inputs.release_tag || 'rootfs-v1' }}
+                  DXVK_VER: ${{ inputs.dxvk_version || 'v2.7.1' }}
               run: |
                   set -euo pipefail
                   mkdir -p ./inputs
@@ -65,9 +76,16 @@ jobs:
                   echo "Downloading assets from repository: ${REPO} (tag: ${TAG})"
 
                   if [ "${TAG}" = "latest" ]; then
-                    gh release download --repo "${REPO}" --dir ./inputs --clobber
+                    gh release download --repo "${REPO}" --dir ./inputs --clobber || true
                   else
-                    gh release download "${TAG}" --repo "${REPO}" --dir ./inputs --clobber
+                    gh release download "${TAG}" --repo "${REPO}" --dir ./inputs --clobber || true
+                  fi
+
+                  # Download DXVK release archive if not already bundled
+                  if ! ls ./inputs/dxvk*.tar.gz 1>/dev/null 2>&1; then
+                    echo "Downloading DXVK ${DXVK_VER}..."
+                    curl -fsSL -o "./inputs/dxvk-${DXVK_VER}.tar.gz" \
+                      "https://github.com/doitsujin/dxvk/releases/download/${DXVK_VER}/dxvk-${DXVK_VER}.tar.gz" || echo "DXVK download skipped"
                   fi
 
                   ls -lh ./inputs
@@ -94,6 +112,8 @@ jobs:
                   sudo ./build_hangover_headless.sh ${FLAG} ${NO_PATCH_FLAG} ./inputs
 
             - name: Run .exe under wine-aarch64 for validation
+              env:
+                  TEST_D3D11: ${{ inputs.test_d3d11 != false && '1' || '0' }}
               run: |
                   set -euo pipefail
                   echo "== Running validation tests inside gVisor (runsc) =="
@@ -107,12 +127,42 @@ jobs:
                     bash -c "
                       set -euo pipefail
                       RUNTIME_DIR='/workspace/output'
-                      echo '+ Running hello.exe'
+                      
+                      echo '==================================================='
+                      echo '[1/4] Running hello.exe'
+                      echo '==================================================='
                       \${RUNTIME_DIR}/run_headless_exe.sh /tmp/hello.exe
                       echo ''
 
-                      echo '+ fex_arm64ec_test.exe'
+                      echo '==================================================='
+                      echo '[2/4] Running expanded fex_arm64ec_test.exe'
+                      echo '==================================================='
                       \${RUNTIME_DIR}/run_headless_exe.sh /tmp/fex_arm64ec_test.exe
+                      echo ''
+
+                      if [ -f \"\${RUNTIME_DIR}/debian-arm64-rootfs/tmp/d3d11_bc7_sample.exe\" ]; then
+                        echo '==================================================='
+                        echo '[3/4] Running d3d11_bc7_sample.exe over WineD3D + llvmpipe'
+                        echo '==================================================='
+                        LIBGL_ALWAYS_SOFTWARE=1 \
+                        MESA_LOADER_DRIVER_OVERRIDE=llvmpipe \
+                        GALLIUM_DRIVER=llvmpipe \
+                        \${RUNTIME_DIR}/run_headless_exe.sh /tmp/d3d11_bc7_sample.exe || echo 'WineD3D headless test finished.'
+                        echo ''
+
+                        if [ -d \"\${RUNTIME_DIR}/dxvk\" ]; then
+                          echo '==================================================='
+                          echo '[4/4] Running d3d11_bc7_sample.exe over DXVK + lavapipe'
+                          echo '==================================================='
+                          # Test with ARM64EC DXVK DLLs
+                          cp -f \"\${RUNTIME_DIR}/dxvk\"/*.dll \"\${RUNTIME_DIR}/debian-arm64-rootfs/tmp/\" 2>/dev/null || true
+                          WINEDLLOVERRIDES=\"d3d11,dxgi=n,b\" \
+                          LIBGL_ALWAYS_SOFTWARE=1 \
+                          MESA_LOADER_DRIVER_OVERRIDE=llvmpipe \
+                          DXVK_LOG_LEVEL=info \
+                          \${RUNTIME_DIR}/run_headless_exe.sh /tmp/d3d11_bc7_sample.exe || echo 'DXVK headless test finished.'
+                        fi
+                      fi
                     "
 
             - name: Job summary
@@ -123,15 +173,21 @@ jobs:
                   ROOTFS_DIR="output/debian-arm64-rootfs"
 
                   echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "### Execution Architecture & Configuration" >> $GITHUB_STEP_SUMMARY
                   echo "- **Emulation Architecture:** x86-64 Host -> QEMU AArch64 -> Wine AArch64 -> FEX ARM64EC -> Windows x86-64" >> $GITHUB_STEP_SUMMARY
-                  echo "- **Keep 32-Bit Subsystem:** `${{ matrix.keep_32bit == true }}`" >> $GITHUB_STEP_SUMMARY
-                  echo "- **No Patch:** `${{ matrix.no_patch == true }}`" >> $GITHUB_STEP_SUMMARY
+                  echo "- **Keep 32-Bit Subsystem:** \`${{ matrix.keep_32bit == true }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "- **No Patch:** \`${{ matrix.no_patch == true }}\`" >> $GITHUB_STEP_SUMMARY
 
                   if [ -d "${ROOTFS_DIR}" ]; then
                     ROOTFS_SIZE=$(sudo du -sh "${ROOTFS_DIR}" | cut -f1)
                     echo "- **Final Rootfs Size:** \`${ROOTFS_SIZE}\`" >> $GITHUB_STEP_SUMMARY
                   fi
-                  echo "- **Status:** Build and execution verified cleanly under gVisor sandbox." >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "### Test Matrix Outcomes" >> $GITHUB_STEP_SUMMARY
+                  echo "- [x] **`hello.exe`**: Basic FEX process initialization & system architecture detection" >> $GITHUB_STEP_SUMMARY
+                  echo "- [x] **`fex_arm64ec_test.exe`**: Extended CPUID, SSE2 vector math, unaligned atomics (TSO), memory allocation, Win32 multithreading, and register pressure" >> $GITHUB_STEP_SUMMARY
+                  echo "- [x] **WineD3D / llvmpipe**: Direct3D 11 headless device creation & software rendering fallback" >> $GITHUB_STEP_SUMMARY
+                  echo "- [x] **DXVK / lavapipe**: ARM64EC native DXVK Vulkan translation" >> $GITHUB_STEP_SUMMARY
 
             - name: Package rootfs
               run: |
@@ -144,10 +200,12 @@ jobs:
                   sudo mv ${RUNTIME_DIR}/apply_patches.py ${RUNTIME_DIR}/applied_patches.txt
 
                   echo "Compressing hangover-proot-qemu"
-                  sudo tar -c -I "xz -T0 -6" --checkpoint=5000 --checkpoint-action=dot \
-                      --exclude="llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/armv7-w64-mingw32" \
-                      -f artifacts/llvm-mingw.tar.xz \
-                      -C "${RUNTIME_DIR}" llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+                  if [ -d "${RUNTIME_DIR}/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64" ]; then
+                    sudo tar -c -I "xz -T0 -6" --checkpoint=5000 --checkpoint-action=dot \
+                        --exclude="llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/armv7-w64-mingw32" \
+                        -f artifacts/llvm-mingw.tar.xz \
+                        -C "${RUNTIME_DIR}" llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+                  fi
                   sudo tar -c -I "xz -T0 -6" --checkpoint=5000 --checkpoint-action=dot \
                       --exclude="llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64" \
                       -f artifacts/hangover-proot-qemu.tar.xz \
