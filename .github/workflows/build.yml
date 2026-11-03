@@ -1,0 +1,168 @@
+name: Hangover Wine ARM64EC (FEX) CI on gVisor
+
+"on":
+    workflow_dispatch:
+        inputs:
+            github_repo:
+                description: "GitHub repository hosting rootfs & proot release assets (owner/repo)"
+                required: true
+                default: "leegao/hangover-wine-on-qemu-on-proot-on-gvisor"
+                type: string
+            release_tag:
+                description: "Release tag to download assets from (e.g., v1.0.0 or latest)"
+                required: true
+                default: "rootfs-v1"
+                type: string
+            keep_32bit:
+                description: "Preserve 32-bit Wine subsystem (/usr/lib/wine/i386-windows)"
+                required: false
+                default: false
+                type: boolean
+            no_patch:
+                description: "Skip applying patches during build"
+                required: false
+                default: false
+                type: boolean
+    push:
+
+jobs:
+    build-and-test-gvisor:
+        name: Build & Test
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+
+        strategy:
+            fail-fast: false
+            matrix:
+                keep_32bit: [true, false]
+                no_patch: [true, false]
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Install system components
+              run: |
+                  set -euo pipefail
+                  sudo mkdir -p /etc/apt/keyrings
+                  curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /etc/apt/keyrings/gvisor.gpg
+                  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gvisor.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+                  sudo apt-get update
+                  sudo apt-get install -y runsc tree xz-utils python3 dpkg binutils xz-utils
+                  sudo runsc install
+                  sudo systemctl restart docker
+                  docker run --rm --runtime=runsc alpine uname -a
+
+            - name: Download ${{ inputs.release_tag || 'rootfs-v1' }}
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ inputs.github_repo || 'leegao/hangover-wine-on-qemu-on-proot-on-gvisor' }}
+                  TAG: ${{ inputs.release_tag || 'rootfs-v1' }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p ./inputs
+
+                  echo "Downloading assets from repository: ${REPO} (tag: ${TAG})"
+
+                  if [ "${TAG}" = "latest" ]; then
+                    gh release download --repo "${REPO}" --dir ./inputs --clobber
+                  else
+                    gh release download "${TAG}" --repo "${REPO}" --dir ./inputs --clobber
+                  fi
+
+                  ls -lh ./inputs
+
+            - name: Build container
+              env:
+                  KEEP_32BIT: ${{ matrix.keep_32bit == true && '1' || '0' }}
+                  NO_PATCH: ${{ matrix.no_patch == true && '1' || '0' }}
+              run: |
+                  set -euo pipefail
+                  chmod +x build_hangover_headless.sh
+
+                  FLAG=""
+                  if [ "${KEEP_32BIT}" = "1" ]; then
+                    FLAG="--keep-32bit"
+                  fi
+
+                  NO_PATCH_FLAG=""
+                  if [ "${NO_PATCH}" = "1" ]; then
+                    NO_PATCH_FLAG="--no-patch"
+                  fi
+
+                  export DEBIAN_FRONTEND=noninteractive
+                  sudo ./build_hangover_headless.sh ${FLAG} ${NO_PATCH_FLAG} ./inputs
+
+            - name: Run .exe under wine-aarch64 for validation
+              run: |
+                  set -euo pipefail
+                  echo "== Running validation tests inside gVisor (runsc) =="
+                  docker run --rm \
+                    --runtime=runsc \
+                    --cap-add=SYS_PTRACE \
+                    --security-opt seccomp=unconfined \
+                    -v "$GITHUB_WORKSPACE:/workspace" \
+                    -w /workspace \
+                    ubuntu:22.04 \
+                    bash -c "
+                      set -euo pipefail
+                      RUNTIME_DIR='/workspace/output'
+                      echo '+ Running hello.exe'
+                      \${RUNTIME_DIR}/run_headless_exe.sh /tmp/hello.exe
+                      echo ''
+
+                      echo '+ fex_arm64ec_test.exe'
+                      \${RUNTIME_DIR}/run_headless_exe.sh /tmp/fex_arm64ec_test.exe
+                    "
+
+            - name: Job summary
+              if: always()
+              run: |
+                  mkdir -p artifacts
+
+                  ROOTFS_DIR="output/debian-arm64-rootfs"
+
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "- **Emulation Architecture:** x86-64 Host -> QEMU AArch64 -> Wine AArch64 -> FEX ARM64EC -> Windows x86-64" >> $GITHUB_STEP_SUMMARY
+                  echo "- **Keep 32-Bit Subsystem:** `${{ matrix.keep_32bit == true }}`" >> $GITHUB_STEP_SUMMARY
+                  echo "- **No Patch:** `${{ matrix.no_patch == true }}`" >> $GITHUB_STEP_SUMMARY
+
+                  if [ -d "${ROOTFS_DIR}" ]; then
+                    ROOTFS_SIZE=$(sudo du -sh "${ROOTFS_DIR}" | cut -f1)
+                    echo "- **Final Rootfs Size:** \`${ROOTFS_SIZE}\`" >> $GITHUB_STEP_SUMMARY
+                  fi
+                  echo "- **Status:** Build and execution verified cleanly under gVisor sandbox." >> $GITHUB_STEP_SUMMARY
+
+            - name: Package rootfs
+              run: |
+                  set -euo pipefail
+                  mkdir -p artifacts
+                  RUNTIME_DIR="output"
+
+                  sudo rm -rf "${RUNTIME_DIR}/proot_tmp"
+                  sudo rm -rf "${RUNTIME_DIR}/debian-arm64-rootfs/tmp"/*
+                  sudo mv ${RUNTIME_DIR}/apply_patches.py ${RUNTIME_DIR}/applied_patches.txt
+
+                  echo "Compressing hangover-proot-qemu"
+                  sudo tar -c -I "xz -T0 -6" --checkpoint=5000 --checkpoint-action=dot \
+                      --exclude="llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/armv7-w64-mingw32" \
+                      -f artifacts/llvm-mingw.tar.xz \
+                      -C "${RUNTIME_DIR}" llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+                  sudo tar -c -I "xz -T0 -6" --checkpoint=5000 --checkpoint-action=dot \
+                      --exclude="llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64" \
+                      -f artifacts/hangover-proot-qemu.tar.xz \
+                      -C "${RUNTIME_DIR}" .
+
+                  cp "${RUNTIME_DIR}/run_headless_exe.sh" artifacts/
+
+                  sudo chown -R "$USER:$USER" artifacts/
+                  ls -lh artifacts/
+                  ls -lh artifacts/ >> $GITHUB_STEP_SUMMARY
+
+            - name: Upload Artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: hangover-proot-qemu-keep32bit-${{ matrix.keep_32bit }}-nopatch-${{ matrix.no_patch }}
+                  path: artifacts/
+                  retention-days: 14
+                  if-no-files-found: error
